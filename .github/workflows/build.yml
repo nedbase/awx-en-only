@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout this repo (fork config/patches)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # ── Resolve which upstream AWX tag to build ───────────────────────
       - name: Determine AWX upstream tag
@@ -42,7 +42,7 @@ jobs:
 
       # ── Check out the upstream AWX source at the pinned tag ───────────
       - name: Check out upstream AWX
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ansible/awx
           ref: ${{ steps.tag.outputs.awx_tag }}
@@ -148,7 +148,7 @@ jobs:
       # ── Docker meta (tags + labels) ───────────────────────────────────
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -159,41 +159,49 @@ jobs:
 
       # ── Set up QEMU + buildx for multi-platform ───────────────────────
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # ── Log in to GHCR ────────────────────────────────────────────────
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Generate the Dockerfile from the Jinja2 template ─────────────
+      # ── Generate the Dockerfile + supervisor configs from templates ──
       #
       # AWX's Makefile delegates this to an Ansible playbook
-      # (tools/ansible/dockerfile.yml) which renders
-      # tools/ansible/roles/dockerfile/templates/Dockerfile.j2.
-      # We reproduce that step here without needing the full Ansible stack
-      # by using Python + Jinja2 directly.
+      # (tools/ansible/dockerfile.yml -> roles/dockerfile). That role renders
+      # FOUR files from templates/, not just the Dockerfile:
+      #
+      #   templates/supervisor_web.conf.j2     -> files/supervisor_web.conf
+      #   templates/supervisor_task.conf.j2    -> files/supervisor_task.conf
+      #   templates/supervisor_rsyslog.conf.j2 -> files/supervisor_rsyslog.conf
+      #   templates/Dockerfile.j2              -> ./Dockerfile
+      #
+      # The Dockerfile ADDs the three supervisor configs from `template_dest`
+      # (tools/ansible/roles/dockerfile/files/), so they must exist in the
+      # build context. We reproduce all four renders here with Python + Jinja2
+      # instead of pulling in the full Ansible stack.
       #
       - name: Install Jinja2 (for Dockerfile generation)
         run: pip install jinja2
 
-      - name: Render Dockerfile from template
+      - name: Render Dockerfile and supervisor configs from templates
         working-directory: awx-src
         run: |
           python3 - <<'EOF'
-          import json, pathlib
+          import pathlib
           from jinja2 import Environment, FileSystemLoader
 
-          # AWX's Dockerfile.j2 is an *Ansible* template: it uses Ansible's
-          # `|bool` filter (e.g. `{% if not headless|bool %}`), which plain
-          # Jinja2 does not provide. Register an equivalent so rendering works
-          # without pulling in the whole Ansible stack.
+          # AWX's templates are *Ansible* templates: they use Ansible's `|bool`
+          # filter (e.g. `{% if not headless|bool %}` / `{% if kube_dev|bool %}`),
+          # which plain Jinja2 does not provide. Register an equivalent so
+          # rendering works without pulling in the whole Ansible stack.
           def ansible_bool(value):
               if isinstance(value, bool):
                   return value
@@ -204,27 +212,39 @@ jobs:
               return str(value).strip().lower() in ("y", "yes", "on", "1", "true", "t")
 
           template_dir = "tools/ansible/roles/dockerfile/templates"
+          # Where the Dockerfile expects the rendered supervisor configs to live.
+          template_dest = "tools/ansible/roles/dockerfile/files"
+
           env = Environment(loader=FileSystemLoader(template_dir))
           env.filters["bool"] = ansible_bool
-          tmpl = env.get_template("Dockerfile.j2")
 
-          # Variables that tools/ansible/dockerfile.yml passes to the template
-          rendered = tmpl.render(
+          # Variables that tools/ansible/dockerfile.yml passes to the templates.
+          context = dict(
               headless=False,
               build_dev=False,
               kube_dev=False,
               image_architecture="x86_64",
               receptor_image="quay.io/ansible/receptor:devel",
-              template_dest="tools/ansible/roles/dockerfile/files",
+              template_dest=template_dest,
           )
 
-          pathlib.Path("Dockerfile").write_text(rendered)
+          # 1) Supervisor configs -> template_dest (must exist before the Dockerfile
+          #    ADDs them). Mirrors the "Render supervisor configs" task in the role.
+          dest_dir = pathlib.Path(template_dest)
+          dest_dir.mkdir(parents=True, exist_ok=True)
+          for name in ("supervisor_web.conf", "supervisor_task.conf", "supervisor_rsyslog.conf"):
+              out = env.get_template(f"{name}.j2").render(**context)
+              (dest_dir / name).write_text(out)
+              print(f"Rendered {dest_dir / name}")
+
+          # 2) The Dockerfile itself.
+          pathlib.Path("Dockerfile").write_text(env.get_template("Dockerfile.j2").render(**context))
           print("Dockerfile written successfully.")
           EOF
 
       # ── Build and push ────────────────────────────────────────────────
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: awx-src
           file: awx-src/Dockerfile
