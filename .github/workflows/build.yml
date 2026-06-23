@@ -134,6 +134,38 @@ jobs:
           print("Updated .linguirc to compile en only.")
           EOF
 
+      # ── Pin floating @devel git requirements ──────────────────────────
+      #
+      # requirements/requirements_git.txt tracks the moving `devel` branch of
+      # four sibling repos. Building an old AWX tag today pulls *today's* devel,
+      # which no longer matches 24.6.1's pinned deps. Concretely,
+      # django-ansible-base@devel now resolves to a build that requires
+      # Django>=4.2.26 (and drops the rest_filters/jwt_consumer/resource_registry
+      # extras), conflicting with AWX 24.6.1's pinned django==4.2.10 and making
+      # `make requirements_awx` fail with ResolutionImpossible.
+      #
+      # Pin each ref to the commit that was on `devel` when AWX 24.6.1 was tagged
+      # (2024-07-02) so the dependency set matches the release. dab @ 12139716
+      # requires Django>=4.2.5,<4.3.0, which django==4.2.10 satisfies. Verified
+      # that the full `pip install` resolves and builds with these pins.
+      - name: Pin floating @devel git requirements
+        working-directory: awx-src
+        run: |
+          set -euo pipefail
+          f=requirements/requirements_git.txt
+          echo "=== before ==="; cat "$f"
+          sed -i \
+            -e 's#system-certifi.git@devel#system-certifi.git@5aa52ab91f9d579bfe52b5acf30ca799f1a563d9#' \
+            -e 's#ansible-runner.git@devel#ansible-runner.git@c3e8cdb24f784a70328f1bfb54eb9c886148acef#' \
+            -e 's#python3-saml.git@devel#python3-saml.git@f90824c4910e36c5a89dd295271be26691204ba3#' \
+            -e 's#django-ansible-base@devel#django-ansible-base@12139716db383b5eaf0022389c11c5c86fd5818c#' \
+            "$f"
+          echo "=== after ==="; cat "$f"
+          if grep -q '@devel' "$f"; then
+            echo "ERROR: a @devel ref was not pinned; upstream format may have changed" >&2
+            exit 1
+          fi
+
       # ── Apply any extra patches from this fork ────────────────────────
       # Drop .patch files into patches/ in this repo to have them applied.
       - name: Apply local patches (if any)
