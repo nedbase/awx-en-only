@@ -1,0 +1,3 @@
+# Don't accidentally commit upstream source checkouts
+awx-src/
+*.patch.bak

@@ -1,0 +1,242 @@
+name: Build and Publish AWX (en-US only)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      awx_tag:
+        description: 'AWX upstream tag to build (e.g. 24.6.1)'
+        required: true
+        default: '24.6.1'
+
+env:
+  REGISTRY: ghcr.io
+  # Set this to your GitHub username / org
+  IMAGE_NAME: ${{ github.repository_owner }}/awx
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout this repo (fork config/patches)
+        uses: actions/checkout@v4
+
+      # ── Resolve which upstream AWX tag to build ───────────────────────
+      - name: Determine AWX upstream tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "awx_tag=${{ github.event.inputs.awx_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            # Fall back to the value pinned in awx-version.txt in this repo
+            echo "awx_tag=$(cat awx-version.txt | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Check out the upstream AWX source at the pinned tag ───────────
+      - name: Check out upstream AWX
+        uses: actions/checkout@v4
+        with:
+          repository: ansible/awx
+          ref: ${{ steps.tag.outputs.awx_tag }}
+          path: awx-src
+          # Full history needed so setuptools-scm can derive the version string
+          fetch-depth: 0
+
+      # ── Strip non-English locales ─────────────────────────────────────
+      #
+      # Two locations hold locale data, and they use DIFFERENT naming:
+      #
+      #   1. awx/locale/<lang>/LC_MESSAGES/django.po   (Django back-end strings)
+      #      Region-coded dirs; English is "en-us". Compiled to .mo by
+      #      tools/scripts/compilemessages.py during the UI build.
+      #
+      #   2. awx/ui/src/locales/<lang>/messages.po     (LinguiJS front-end strings)
+      #      Short-code dirs (en, es, fr, ja, ko, nl, zh) plus a "zu" pseudo-
+      #      locale. English is "en" — there is NO "en-us" here. Compiled to JS
+      #      by `lingui compile` (npm run compile-strings) before webpack build.
+      #
+      # NOTE: deleting the catalogs is necessary but NOT sufficient to force
+      # English — see the "Force English in UI locale loader" step below.
+      #
+      - name: Strip non-English locales
+        working-directory: awx-src
+        run: |
+          set -euo pipefail
+
+          echo "=== Django backend locales (awx/locale/) — keeping en-us ==="
+          ls awx/locale/
+          for dir in awx/locale/*/; do
+            lang=$(basename "$dir")
+            if [ "$lang" != "en-us" ]; then
+              echo "  removing backend $dir"
+              rm -rf "$dir"
+            fi
+          done
+          echo "=== Remaining backend locales ==="
+          ls awx/locale/
+
+          echo "=== UI front-end locales (awx/ui/src/locales/) — keeping en ==="
+          ls awx/ui/src/locales/
+          for dir in awx/ui/src/locales/*/; do
+            lang=$(basename "$dir")
+            if [ "$lang" != "en" ]; then
+              echo "  removing frontend $dir"
+              rm -rf "$dir"
+            fi
+          done
+          echo "=== Remaining frontend locales ==="
+          ls awx/ui/src/locales/
+
+      # ── Force English in the UI locale loader ─────────────────────────
+      #
+      # awx/ui/src/App.js only falls back to English when the browser's
+      # language is NOT a key in the `locales` map exported by i18nLoader.js.
+      # That map lists all shipped languages, so e.g. a Dutch browser keeps
+      # "nl" and then dynamicActivate('nl') does
+      #   import('./locales/nl/messages')
+      # against the catalog we just deleted — breaking the UI at runtime.
+      #
+      # Reducing the map to just `en` makes every non-English browser fall
+      # back to English and load the one catalog that still exists. We also
+      # trim .linguirc so `lingui compile` only processes `en`.
+      #
+      - name: Force English in UI locale loader
+        working-directory: awx-src
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import re, json, pathlib
+
+          loader = pathlib.Path("awx/ui/src/i18nLoader.js")
+          src = loader.read_text()
+          src, n = re.subn(
+              r"export const locales = \{.*?\};",
+              "export const locales = {\n  en: 'English',\n};",
+              src, count=1, flags=re.S,
+          )
+          assert n == 1, "could not find `export const locales` block in i18nLoader.js"
+          loader.write_text(src)
+          print("Rewrote i18nLoader.js locales map to en-only.")
+
+          rc = pathlib.Path("awx/ui/.linguirc")
+          cfg = json.loads(rc.read_text())
+          cfg["locales"] = ["en"]
+          cfg.pop("pseudoLocale", None)  # pseudoLocale 'zu' no longer present
+          rc.write_text(json.dumps(cfg, indent=2))
+          print("Updated .linguirc to compile en only.")
+          EOF
+
+      # ── Apply any extra patches from this fork ────────────────────────
+      # Drop .patch files into patches/ in this repo to have them applied.
+      - name: Apply local patches (if any)
+        working-directory: awx-src
+        run: |
+          shopt -s nullglob
+          for patch in "$GITHUB_WORKSPACE/patches"/*.patch; do
+            echo "Applying $patch"
+            git apply "$patch"
+          done
+
+      # ── Docker meta (tags + labels) ───────────────────────────────────
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # For workflow_dispatch builds tag with the AWX version
+            type=raw,value=${{ steps.tag.outputs.awx_tag }},enable=true
+            # For git tags (vX.Y.Z) also produce a 'latest'
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+
+      # ── Set up QEMU + buildx for multi-platform ───────────────────────
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Log in to GHCR ────────────────────────────────────────────────
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Generate the Dockerfile from the Jinja2 template ─────────────
+      #
+      # AWX's Makefile delegates this to an Ansible playbook
+      # (tools/ansible/dockerfile.yml) which renders
+      # tools/ansible/roles/dockerfile/templates/Dockerfile.j2.
+      # We reproduce that step here without needing the full Ansible stack
+      # by using Python + Jinja2 directly.
+      #
+      - name: Install Jinja2 (for Dockerfile generation)
+        run: pip install jinja2
+
+      - name: Render Dockerfile from template
+        working-directory: awx-src
+        run: |
+          python3 - <<'EOF'
+          import json, pathlib
+          from jinja2 import Environment, FileSystemLoader
+
+          # AWX's Dockerfile.j2 is an *Ansible* template: it uses Ansible's
+          # `|bool` filter (e.g. `{% if not headless|bool %}`), which plain
+          # Jinja2 does not provide. Register an equivalent so rendering works
+          # without pulling in the whole Ansible stack.
+          def ansible_bool(value):
+              if isinstance(value, bool):
+                  return value
+              if isinstance(value, (int, float)):
+                  return value != 0
+              if value is None:
+                  return False
+              return str(value).strip().lower() in ("y", "yes", "on", "1", "true", "t")
+
+          template_dir = "tools/ansible/roles/dockerfile/templates"
+          env = Environment(loader=FileSystemLoader(template_dir))
+          env.filters["bool"] = ansible_bool
+          tmpl = env.get_template("Dockerfile.j2")
+
+          # Variables that tools/ansible/dockerfile.yml passes to the template
+          rendered = tmpl.render(
+              headless=False,
+              build_dev=False,
+              kube_dev=False,
+              image_architecture="x86_64",
+              receptor_image="quay.io/ansible/receptor:devel",
+              template_dest="tools/ansible/roles/dockerfile/files",
+          )
+
+          pathlib.Path("Dockerfile").write_text(rendered)
+          print("Dockerfile written successfully.")
+          EOF
+
+      # ── Build and push ────────────────────────────────────────────────
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: awx-src
+          file: awx-src/Dockerfile
+          # Build amd64 only by default; add linux/arm64 if you need it
+          # (arm64 builds take ~2× longer on GitHub-hosted runners via QEMU)
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.tag.outputs.awx_tag }}
+            SETUPTOOLS_SCM_PRETEND_VERSION=${{ steps.tag.outputs.awx_tag }}
+          # Cache layers between runs to keep build times reasonable
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
