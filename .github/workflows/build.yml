@@ -166,6 +166,35 @@ jobs:
             exit 1
           fi
 
+      # ── Pin the sdist build backend ───────────────────────────────────
+      #
+      # `make sdist` runs `python -m build -s`, which builds in an ISOLATED
+      # environment created from pyproject.toml's [build-system] requires
+      # (`setuptools>=45`, unpinned). pip installs today's setuptools (>=81),
+      # which removed `pkg_resources`. awx/__init__.py does `import pkg_resources`
+      # to compute the version, so the sdist build fails with:
+      #     ModuleNotFoundError: No module named 'pkg_resources'
+      #     NameError: name 'pkg_resources' is not defined
+      #     ERROR Backend subprocess exited when trying to invoke build_sdist
+      #
+      # Pin the build backend to the versions AWX 24.6.1 bootstraps its venv
+      # with (setuptools 69.0.2 / setuptools_scm 8.0.4), which still ship
+      # pkg_resources. Verified `python -m build -s` then produces the tarball.
+      - name: Pin sdist build backend (setuptools)
+        working-directory: awx-src
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("pyproject.toml")
+          s = p.read_text()
+          old = 'requires = ["setuptools>=45", "setuptools_scm[toml]>=6.2"]'
+          new = 'requires = ["setuptools==69.0.2", "setuptools_scm[toml]==8.0.4"]'
+          assert old in s, "[build-system] requires line not found; upstream format may have changed"
+          p.write_text(s.replace(old, new, 1))
+          print("Pinned [build-system] requires:", new)
+          EOF
+
       # ── Apply any extra patches from this fork ────────────────────────
       # Drop .patch files into patches/ in this repo to have them applied.
       - name: Apply local patches (if any)
