@@ -283,8 +283,22 @@ jobs:
           # builder and final stages.
           patched = dockerfile.replace("openssl-3.0.7", "openssl")
           assert patched != dockerfile, "expected to find pinned 'openssl-3.0.7' to unpin"
+
+          # AWX 24.6.1 pins Node 16.13.1 (`npm install -g n && n 16.13.1`) and
+          # builds ui_next from `ansible-ui@main` (cloned fresh at build time).
+          # Today's ansible-ui main pulls a dependency tree (sharp via
+          # favicons-webpack-plugin, etc.) that requires Node >=18.17, so the
+          # `make sdist` ui_next webpack build fails on Node 16 with:
+          #     Error: Could not load the "sharp" module using the linux-x64 runtime
+          #     - Please upgrade Node.js: Found 16.13.1 Requires ^18.17.0 || ...
+          # and emits many `npm WARN EBADENGINE` warnings. Bump the pinned Node
+          # to 20 (current LTS, satisfies the requirement) to build ui_next and
+          # clear the engine warnings.
+          before = patched
+          patched = patched.replace("n 16.13.1", "n 20")
+          assert patched != before, "expected to find pinned Node 'n 16.13.1' to bump"
           pathlib.Path("Dockerfile").write_text(patched)
-          print("Dockerfile written successfully (openssl unpinned).")
+          print("Dockerfile written successfully (openssl unpinned, Node bumped to 20).")
           EOF
 
       # ── Build and push ────────────────────────────────────────────────
