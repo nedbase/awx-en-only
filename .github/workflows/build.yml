@@ -238,8 +238,21 @@ jobs:
               print(f"Rendered {dest_dir / name}")
 
           # 2) The Dockerfile itself.
-          pathlib.Path("Dockerfile").write_text(env.get_template("Dockerfile.j2").render(**context))
-          print("Dockerfile written successfully.")
+          dockerfile = env.get_template("Dockerfile.j2").render(**context)
+
+          # AWX 24.6.1 hard-pins `openssl-3.0.7` (see JIRA AAP-23449). The base
+          # image quay.io/centos/centos:stream9 is a rolling release and that
+          # exact build has since been purged from the repos, so the builder's
+          # `dnf install` now fails with:
+          #     No match for argument: openssl-3.0.7
+          #     Error: Unable to find a match: openssl-3.0.7
+          # CentOS Stream 9 only offers openssl 3.5.x today, so drop the
+          # micro-version pin and take the current openssl. Appears in both the
+          # builder and final stages.
+          patched = dockerfile.replace("openssl-3.0.7", "openssl")
+          assert patched != dockerfile, "expected to find pinned 'openssl-3.0.7' to unpin"
+          pathlib.Path("Dockerfile").write_text(patched)
+          print("Dockerfile written successfully (openssl unpinned).")
           EOF
 
       # ── Build and push ────────────────────────────────────────────────
